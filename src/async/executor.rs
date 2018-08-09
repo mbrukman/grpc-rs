@@ -19,8 +19,9 @@ use futures::executor::{self, Notify, Spawn};
 use futures::{Async, Future};
 use grpc_sys::{self, GprTimespec, GrpcAlarm};
 
+use call::Call;
 use cq::CompletionQueue;
-use error::{Error, Result};
+use error::Result;
 use super::lock::SpinLock;
 use super::CallTag;
 
@@ -62,9 +63,9 @@ impl Drop for Alarm {
 type SpawnHandle = Option<Spawn<BoxFuture<(), ()>>>;
 
 struct NotifyContext {
-    cq: CompletionQueue,
     alarmed: bool,
-    alarm: Option<Alarm>,
+    // alarm: Option<Alarm>,
+    call: Call,
 }
 
 impl NotifyContext {
@@ -73,19 +74,20 @@ impl NotifyContext {
     /// It only makes sence to call this function from the thread
     /// that cq is not run on.
     fn notify(&mut self, tag: Box<CallTag>) {
-        self.alarm.take();
-        let mut alarm = match Alarm::new(&self.cq, tag) {
-            Ok(a) => a,
-            Err(Error::QueueShutdown) => {
-                // If the queue is shutdown, then the tag will be notified
-                // eventually. So just skip here.
-                return;
-            }
-            Err(e) => panic!("failed to create alarm: {:?}", e),
-        };
-        alarm.alarm();
-        // We need to keep the alarm until tag is resolved.
-        self.alarm = Some(alarm);
+        // self.alarm.take();
+        // let mut alarm = match Alarm::new(&self.cq, tag) {
+        //     Ok(a) => a,
+        //     Err(Error::QueueShutdown) => {
+        //         // If the queue is shutdown, then the tag will be notified
+        //         // eventually. So just skip here.
+        //         return;
+        //     }
+        //     Err(e) => panic!("failed to create alarm: {:?}", e),
+        // };
+        // alarm.alarm();
+        // // We need to keep the alarm until tag is resolved.
+        // self.alarm = Some(alarm);
+        self.call.kick_completion_queue(tag);
     }
 }
 
@@ -101,21 +103,20 @@ pub struct SpawnNotify {
 }
 
 impl SpawnNotify {
-    fn new(s: Spawn<BoxFuture<(), ()>>, cq: CompletionQueue) -> SpawnNotify {
+    fn new(s: Spawn<BoxFuture<(), ()>>, call: Call, worker_id: ThreadId) -> SpawnNotify {
         SpawnNotify {
-            worker_id: cq.worker_id(),
+            worker_id,
             handle: Arc::new(SpinLock::new(Some(s))),
             ctx: Arc::new(SpinLock::new(NotifyContext {
-                cq,
                 alarmed: false,
-                alarm: None,
+                call,
             })),
         }
     }
 
     pub fn resolve(self, success: bool) {
         // it should always be canceled for now.
-        assert!(!success);
+        assert!(success);
         poll(Arc::new(self.clone()), true);
     }
 }
@@ -180,12 +181,12 @@ impl<'a> Executor<'a> {
     ///
     /// If you want to trace the future, you may need to create a sender/receiver
     /// pair by yourself.
-    pub fn spawn<F>(&self, f: F)
+    pub fn spawn<F>(&self, f: F, call: Call)
     where
         F: Future<Item = (), Error = ()> + Send + 'static,
     {
         let s = executor::spawn(Box::new(f) as BoxFuture<_, _>);
-        let notify = Arc::new(SpawnNotify::new(s, self.cq.clone()));
+        let notify = Arc::new(SpawnNotify::new(s, call, self.cq.worker_id()));
         poll(notify, false)
     }
 }
